@@ -1,11 +1,15 @@
 package jet
 
 import (
+	"archive/zip"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/hazelcast/hazelcast-go-client"
@@ -16,6 +20,8 @@ import (
 	"github.com/hazelcast/hazelcast-commandline-client/internal/log"
 	"github.com/hazelcast/hazelcast-commandline-client/internal/proto/codec"
 	"github.com/hazelcast/hazelcast-commandline-client/internal/proto/codec/control"
+
+	proto "github.com/hazelcast/hazelcast-go-client"
 )
 
 type spinner interface {
@@ -86,8 +92,11 @@ func (j Jet) SubmitYamlJob(ctx context.Context, yaml string, jobm map[interface{
 		resl := res.([]interface{})
 		for _, r := range resl {
 			rm := r.(map[interface{}]interface{})
+			resourceId := rm["id"].(string)
 			path := rm["path"].(string)
-			err = uploadDirectoryResource(ctx, jobId, path)
+			fmt.Printf("upload resource %s\n", resourceId)
+			fmt.Printf("  source=%s\n", path)
+			err = uploadDirectoryResource(ctx, j.ci.Client(), jobId, resourceId, path)
 			if err != nil {
 				return fmt.Errorf("failed to upload resource: %w", err)
 			}
@@ -111,33 +120,150 @@ func (j Jet) SubmitYamlJob(ctx context.Context, yaml string, jobm map[interface{
 	return nil
 }
 
-func uploadDirectoryResource(ctx context.Context, jobId int64, path string) error {
-	/*
-		// prefix is f. for file, c. for class (see job repository)
-		var id = Path.GetFileName(path);
-		var key = $"f.dotnet-{id}-";
-		var rnd = Guid.NewGuid().ToString("N").Substring(0, 9);
-		var zipPath = Path.Combine(Path.GetTempPath(), rnd + "-" + Path.GetFileName(id) + ".zip");
+func uploadDirectoryResource(ctx context.Context, client *hazelcast.Client, jobId int64, resourceId string, path string) error {
 
-		using (var zipFile = new ZipFile())
-		{
-		    zipFile.CompressionMethod = CompressionMethod.Deflate;
-		    zipFile.AddDirectory(path);
-		    zipFile.Save(zipPath);
+	key := "f." + resourceId
+	rnd := strings.Replace(types.NewUUID().String(), "-", "", -1)[:9]
+	_, filename := filepath.Split(path)
+	zipPath := filepath.Join(os.TempDir(), rnd+"-"+filename+".zip")
+
+	err := Zip(zipPath, path)
+	if err != nil {
+		return fmt.Errorf("failed to zip directory (failed to zip) %w", err)
+	}
+
+	resourcesMapName := "__jet.resources." + JobIdToString(jobId)
+	fmt.Println("  jobId: ", jobId, " -> resources map: ", resourcesMapName)
+	jobResources, err := client.GetMap(ctx, resourcesMapName)
+	if err != nil {
+		return fmt.Errorf("failed to get resources map %s %w", resourcesMapName, err)
+	}
+	err = Upload(ctx, jobResources, key, zipPath)
+	os.Remove(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to zip directory (failed to zip) %w", err)
+	}
+
+	return nil
+}
+
+func JobIdToString(jobId int64) string {
+	buf := []rune("0000-0000-0000-0000")
+	hexStr := fmt.Sprintf("%x", jobId)
+	j := 18
+	for i := len(hexStr) - 1; i >= 0; i-- {
+		buf[j] = rune(hexStr[i])
+		if j == 15 || j == 10 || j == 5 {
+			j -= 1
+		}
+		j -= 1
+	}
+	return string(buf)
+}
+
+// https://stackoverflow.com/questions/37869793/how-do-i-zip-a-directory-containing-sub-directories-or-files-in-golang
+func Zip(zipPath string, sourcePath string) error {
+
+	sourcePath = strings.ReplaceAll(sourcePath, "\\", "/") // normalize
+
+	file, err := os.Create(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to zip directory (failed to create zip file) %w", err)
+	}
+	defer file.Close()
+
+	w := zip.NewWriter(file) // FIXME set method to Deflate, how?
+	defer w.Close()
+
+	walker := func(path string, info os.FileInfo, err error) error {
+		//fmt.Printf("Crawling: %#v\n", path)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil // FIXME but, recursive?!
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to zip directory (failed to open path) %w", err)
+		}
+		defer file.Close()
+
+		// Ensure that `path` is not absolute; it should not start with "/",
+		// ie that it is a zip-root relative path !
+		pathInZip := strings.ReplaceAll(path, "\\", "/") // normalize
+		pathInZip = strings.TrimPrefix(pathInZip, sourcePath)
+		pathInZip = strings.TrimLeft(pathInZip, "/")
+		f, err := w.Create(pathInZip)
+		if err != nil {
+			return fmt.Errorf("failed to zip directory (failed to create path in zip) %w", err)
 		}
 
-		try
-		{
-		    var resourcesMapName = $"__jet.resources.{JobIdToString(jobId)}";
-		    await using var jobResources = await _client.GetMapAsync<string, byte[]>(resourcesMapName).CfAwait();
-		    await new MapOutputStream(jobResources, key).WriteFileAsync(zipPath).CfAwait();
+		_, err = io.Copy(f, file)
+		if err != nil {
+			return fmt.Errorf("failed to zip directory (failed to copy to zip) %w", err)
 		}
-		finally
-		{
-		    File.Delete(zipPath);
+
+		return nil
+	}
+	err = filepath.Walk(sourcePath, walker)
+	if err != nil {
+		return fmt.Errorf("failed to zip directory %w", err)
+	}
+
+	return nil
+}
+
+func Upload(ctx context.Context, resources *hazelcast.Map, prefix string, path string) error {
+
+	chunkSize := 1 << 17
+	chunkIndex := 0
+	buffer := make([]byte, chunkSize)
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open zip: %w", err)
+	}
+	n := 1
+	for n > 0 {
+		readCount := 0
+		for {
+			n, err = f.Read(buffer[readCount:])
+			if err != nil {
+				if err == io.EOF {
+					n = 0
+				} else {
+					return fmt.Errorf("failed to read zip: %w", err)
+				}
+			}
+			readCount += n
+			if readCount == chunkSize || n == 0 {
+				break
+			}
 		}
-	*/
-	return nil //fmt.Errorf("not implemented")
+		if readCount > 0 {
+			if readCount != chunkSize {
+				buffer = buffer[:readCount]
+				//buffer2 := make([]byte, readCount)
+				//copy(buffer2, buffer[:readCount])
+				//buffer = buffer2
+			}
+			fmt.Println("  chunk of size ", len(buffer), " bytes ->  ", prefix+"_"+strconv.Itoa(chunkIndex))
+			err = resources.Set(ctx, prefix+"_"+strconv.Itoa(chunkIndex), buffer)
+			if err != nil {
+				return fmt.Errorf("failed to upload chunk: %w", err)
+			}
+			chunkIndex += 1
+		}
+	}
+
+	buffer = make([]byte, proto.IntSizeInBytes)
+	binary.BigEndian.PutUint32(buffer, uint32(chunkIndex))
+	err = resources.Set(ctx, prefix, buffer)
+	if err != nil {
+		return fmt.Errorf("failed to upload chunks count: %w", err)
+	}
+
+	return nil
 }
 
 func (j Jet) SubmitJob(ctx context.Context, path, jobName, className, snapshot string, args []string, br BinaryReader) error {

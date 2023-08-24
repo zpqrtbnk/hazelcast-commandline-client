@@ -176,7 +176,6 @@ func submitYaml(ctx context.Context, ci *hazelcast.ClientInternal, ec plug.ExecC
 	// validate resources
 	res, exists := jobm["resources"]
 	if exists {
-		fmt.Println("found resources element")
 		var resl []interface{}
 		resl, ok = res.([]interface{})
 		if !ok {
