@@ -94,8 +94,7 @@ func (j Jet) SubmitYamlJob(ctx context.Context, yaml string, jobm map[interface{
 			rm := r.(map[interface{}]interface{})
 			resourceId := rm["id"].(string)
 			path := rm["path"].(string)
-			fmt.Printf("upload resource %s\n", resourceId)
-			fmt.Printf("  source=%s\n", path)
+			fmt.Printf("upload resource %s DIRECTORY %s\n", resourceId, path)
 			err = uploadDirectoryResource(ctx, j.ci.Client(), jobId, resourceId, path)
 			if err != nil {
 				return fmt.Errorf("failed to upload resource: %w", err)
@@ -133,7 +132,7 @@ func uploadDirectoryResource(ctx context.Context, client *hazelcast.Client, jobI
 	}
 
 	resourcesMapName := "__jet.resources." + JobIdToString(jobId)
-	fmt.Println("  jobId: ", jobId, " -> resources map: ", resourcesMapName)
+	//fmt.Println("  jobId: ", jobId, " -> resources map: ", resourcesMapName)
 	jobResources, err := client.GetMap(ctx, resourcesMapName)
 	if err != nil {
 		return fmt.Errorf("failed to get resources map %s %w", resourcesMapName, err)
@@ -247,7 +246,7 @@ func Upload(ctx context.Context, resources *hazelcast.Map, prefix string, path s
 				//copy(buffer2, buffer[:readCount])
 				//buffer = buffer2
 			}
-			fmt.Println("  chunk of size ", len(buffer), " bytes ->  ", prefix+"_"+strconv.Itoa(chunkIndex))
+			//fmt.Println("  chunk of size ", len(buffer), " bytes ->  ", prefix+"_"+strconv.Itoa(chunkIndex))
 			err = resources.Set(ctx, prefix+"_"+strconv.Itoa(chunkIndex), buffer)
 			if err != nil {
 				return fmt.Errorf("failed to upload chunk: %w", err)
